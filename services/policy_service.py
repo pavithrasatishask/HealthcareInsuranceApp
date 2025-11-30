@@ -23,7 +23,7 @@ class PolicyService:
     @staticmethod
     def validate_policy_data(policy_data: dict) -> tuple[bool, str]:
         """
-        Validate policy data.
+        Validate policy data including healthcare-specific fields.
         
         Args:
             policy_data: Dictionary containing policy data
@@ -31,18 +31,45 @@ class PolicyService:
         Returns:
             tuple: (is_valid, error_message)
         """
-        # Check required fields
-        required_fields = ['user_id', 'policy_type', 'coverage_amount', 'premium_amount', 'start_date', 'end_date']
+        # Check required fields (updated to include payer program)
+        required_fields = [
+            'user_id', 'payer_program', 'payer_name', 'policy_type', 
+            'coverage_amount', 'premium_amount', 'start_date', 'end_date'
+        ]
         for field in required_fields:
             if field not in policy_data:
                 return False, f"{field} is required"
+        
+        # Validate payer_program
+        valid_payer_programs = ['medicare', 'medicaid', 'commercial', 'other_government']
+        if policy_data['payer_program'] not in valid_payer_programs:
+            return False, f"payer_program must be one of: {', '.join(valid_payer_programs)}"
+        
+        # Medicare-specific validation
+        if policy_data['payer_program'] == 'medicare':
+            if 'medicare_part' not in policy_data or not policy_data['medicare_part']:
+                return False, "medicare_part is required for Medicare policies (Part A, B, C, or D)"
+            if policy_data['medicare_part'] not in ['Part A', 'Part B', 'Part C', 'Part D']:
+                return False, "medicare_part must be Part A, B, C, or D"
+        
+        # Medicaid-specific validation
+        if policy_data['payer_program'] == 'medicaid':
+            if 'medicaid_state' not in policy_data or not policy_data['medicaid_state']:
+                return False, "medicaid_state is required for Medicaid policies (2-letter state code)"
+            if len(policy_data['medicaid_state']) != 2:
+                return False, "medicaid_state must be a 2-letter state code (e.g., CA, NY)"
         
         # Validate amounts are positive
         if float(policy_data['coverage_amount']) <= 0:
             return False, "Coverage amount must be positive"
         
-        if float(policy_data['premium_amount']) <= 0:
-            return False, "Premium amount must be positive"
+        if float(policy_data['premium_amount']) < 0:
+            return False, "Premium amount cannot be negative"
+        
+        # Validate deductible if provided
+        if 'deductible_amount' in policy_data:
+            if float(policy_data['deductible_amount']) < 0:
+                return False, "Deductible amount cannot be negative"
         
         # Validate date range
         start_date = datetime.strptime(policy_data['start_date'], '%Y-%m-%d').date()
@@ -61,7 +88,7 @@ class PolicyService:
     @staticmethod
     def create_policy(policy_data: dict, created_by: int) -> dict:
         """
-        Create a new insurance policy.
+        Create a new insurance policy with healthcare payer program details.
         
         Args:
             policy_data: Dictionary containing policy data
@@ -99,14 +126,29 @@ class PolicyService:
         insert_data = {
             'policy_number': policy_number,
             'user_id': policy_data['user_id'],
+            'payer_program': policy_data['payer_program'],
+            'payer_name': policy_data['payer_name'],
+            'payer_id': policy_data.get('payer_id'),
             'policy_type': policy_data['policy_type'],
+            'plan_name': policy_data.get('plan_name'),
             'coverage_amount': float(policy_data['coverage_amount']),
             'premium_amount': float(policy_data['premium_amount']),
+            'deductible_amount': float(policy_data.get('deductible_amount', 0.0)),
+            'out_of_pocket_max': float(policy_data['out_of_pocket_max']) if 'out_of_pocket_max' in policy_data else None,
             'status': policy_data.get('status', 'active'),
             'start_date': policy_data['start_date'],
             'end_date': policy_data['end_date'],
             'created_by': created_by
         }
+        
+        # Add Medicare-specific fields if applicable
+        if policy_data['payer_program'] == 'medicare':
+            insert_data['medicare_part'] = policy_data.get('medicare_part')
+        
+        # Add Medicaid-specific fields if applicable
+        if policy_data['payer_program'] == 'medicaid':
+            insert_data['medicaid_state'] = policy_data.get('medicaid_state')
+            insert_data['medicaid_program_type'] = policy_data.get('medicaid_program_type')
         
         # Insert policy
         response = supabase.table('policies').insert(insert_data).execute()
@@ -147,7 +189,23 @@ class PolicyService:
             list: List of policies
         """
         supabase = SupabaseClient.get_client()
-        response = supabase.table('policies').select('*').eq('user_id', user_id).execute()
+        response = supabase.table('policies').select('*').eq('user_id', user_id).order('created_at', desc=True).execute()
+        
+        return response.data
+    
+    @staticmethod
+    def get_policies_by_payer_program(payer_program: str) -> list:
+        """
+        Get policies filtered by payer program (Medicare, Medicaid, Commercial).
+        
+        Args:
+            payer_program: Payer program type
+            
+        Returns:
+            list: List of policies
+        """
+        supabase = SupabaseClient.get_client()
+        response = supabase.table('policies').select('*').eq('payer_program', payer_program).order('created_at', desc=True).execute()
         
         return response.data
     
@@ -160,9 +218,52 @@ class PolicyService:
             list: List of all policies
         """
         supabase = SupabaseClient.get_client()
-        response = supabase.table('policies').select('*').execute()
+        response = supabase.table('policies').select('*').order('created_at', desc=True).execute()
         
         return response.data
+    
+    @staticmethod
+    def get_payer_program_stats() -> dict:
+        """
+        Get statistics grouped by payer program.
+        
+        Returns:
+            dict: Statistics by payer program
+        """
+        supabase = SupabaseClient.get_client()
+        response = supabase.table('policies').select('payer_program, status, coverage_amount, premium_amount').execute()
+        
+        if not response.data or len(response.data) == 0:
+            return {
+                'total_policies': 0,
+                'by_program': {}
+            }
+        
+        # Group statistics
+        stats = {
+            'total_policies': len(response.data),
+            'by_program': {}
+        }
+        
+        programs = {}
+        for policy in response.data:
+            prog = policy['payer_program']
+            if prog not in programs:
+                programs[prog] = {
+                    'count': 0,
+                    'active': 0,
+                    'total_coverage': 0,
+                    'total_premiums': 0
+                }
+            
+            programs[prog]['count'] += 1
+            if policy['status'] == 'active':
+                programs[prog]['active'] += 1
+            programs[prog]['total_coverage'] += float(policy.get('coverage_amount', 0))
+            programs[prog]['total_premiums'] += float(policy.get('premium_amount', 0))
+        
+        stats['by_program'] = programs
+        return stats
     
     @staticmethod
     def update_policy(policy_id: int, update_data: dict) -> dict:
@@ -184,14 +285,24 @@ class PolicyService:
         update_data.pop('created_at', None)
         update_data.pop('created_by', None)
         
+        # Validate payer_program if being updated
+        if 'payer_program' in update_data:
+            valid_payer_programs = ['medicare', 'medicaid', 'commercial', 'other_government']
+            if update_data['payer_program'] not in valid_payer_programs:
+                raise ValueError(f"payer_program must be one of: {', '.join(valid_payer_programs)}")
+        
         # Validate amounts if provided
         if 'coverage_amount' in update_data:
             if float(update_data['coverage_amount']) <= 0:
                 raise ValueError("Coverage amount must be positive")
         
         if 'premium_amount' in update_data:
-            if float(update_data['premium_amount']) <= 0:
-                raise ValueError("Premium amount must be positive")
+            if float(update_data['premium_amount']) < 0:
+                raise ValueError("Premium amount cannot be negative")
+        
+        if 'deductible_amount' in update_data:
+            if float(update_data['deductible_amount']) < 0:
+                raise ValueError("Deductible amount cannot be negative")
         
         # Validate date range if dates are being updated
         if 'start_date' in update_data or 'end_date' in update_data:
@@ -266,4 +377,3 @@ class PolicyService:
         end_date = datetime.strptime(policy['end_date'], '%Y-%m-%d').date()
         
         return start_date <= today <= end_date
-
